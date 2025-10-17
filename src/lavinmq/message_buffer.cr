@@ -1,81 +1,83 @@
 module Lavinmq
-  # Ring buffer for message buffering during connection outages
-  # Thread-safe/fiber-safe implementation
+  # Lock-free ring buffer for message buffering during connection outages
+  # Thread-safe/fiber-safe implementation using atomic operations
+  # Provides zero-contention high-performance message buffering
   class MessageBuffer
     getter max_size : Int32
-    getter dropped_count : Int64 = 0_i64
 
-    @buffer : Deque(String)
-    @mutex : Mutex
+    @buffer : LockFree::RingBuffer(String)
+    @dropped_count : Atomic(Int64)
 
     def initialize(@max_size : Int32 = Config::DEFAULT_BUFFER_SIZE)
-      @buffer = Deque(String).new
-      @mutex = Mutex.new
+      @buffer = LockFree::RingBuffer(String).new(@max_size)
+      @dropped_count = Atomic(Int64).new(0_i64)
     end
 
-    # Add message to buffer
+    def dropped_count : Int64
+      @dropped_count.get
+    end
+
+    # Add message to buffer (lock-free operation)
     # If buffer is full, drops the oldest message and returns it
     # Returns nil if no message was dropped
     def enqueue(message : String) : String?
-      @mutex.synchronize do
-        dropped = nil
-        if @buffer.size >= @max_size
-          # Ring buffer: drop oldest, accept new
-          @dropped_count += 1
-          dropped = @buffer.shift # Remove and return oldest
-        end
-
-        @buffer << message
-        dropped
+      # Try to enqueue, if buffer is full it will return false
+      if @buffer.enqueue(message)
+        return nil # No message dropped
       end
+
+      # Buffer is full, dequeue oldest and try again
+      dropped = @buffer.dequeue
+      @dropped_count.add(1_i64)
+
+      # Retry enqueue (should succeed now)
+      @buffer.enqueue(message)
+
+      dropped
     end
 
-    # Remove and return oldest message
+    # Remove and return oldest message (lock-free operation)
     def dequeue : String?
-      @mutex.synchronize do
-        @buffer.shift?
-      end
+      @buffer.dequeue
     end
 
-    # Remove all messages and return them
+    # Remove all messages and return them (atomic operation)
     def drain : Array(String)
-      @mutex.synchronize do
-        messages = @buffer.to_a
-        @buffer.clear
-        messages
+      messages = [] of String
+      while msg = @buffer.dequeue
+        messages << msg
       end
+      messages
     end
 
-    # Check if buffer is empty
+    # Check if buffer is empty (lock-free read)
     def empty? : Bool
-      @mutex.synchronize { @buffer.empty? }
+      @buffer.size == 0
     end
 
-    # Check if buffer is full
+    # Check if buffer is full (lock-free read)
     def full? : Bool
-      @mutex.synchronize { @buffer.size >= @max_size }
+      @buffer.size >= @max_size
     end
 
-    # Get current buffer count
+    # Get current buffer count (atomic read)
     def count : Int32
-      @mutex.synchronize { @buffer.size }
+      @buffer.size
     end
 
     # Alias for count (observability API)
     def size : Int32
-      count
+      @buffer.size
     end
 
     # Get buffer capacity
     def capacity : Int32
-      @max_size
+      @buffer.capacity
     end
 
-    # Clear all messages
+    # Clear all messages (atomic operation)
     def clear
-      @mutex.synchronize do
-        @buffer.clear
-      end
+      @buffer.clear
     end
   end
 end

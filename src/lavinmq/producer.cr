@@ -200,7 +200,12 @@ module Lavinmq
         else
           # Another fiber already created a channel, close ours and use theirs
           new_channel.close rescue nil
-          return @channel.get.not_nil!
+          # Get the channel that was set by another fiber
+          if existing = @channel.get
+            return existing
+          end
+          # Rare case: channel was cleared between CAS and get, retry
+          return get_or_create_channel
         end
       end
 
@@ -215,7 +220,13 @@ module Lavinmq
       else
         # Another fiber already created a channel
         new_channel.close rescue nil
-        @channel.get.not_nil!
+        # Get the channel that was set by another fiber
+        if existing = @channel.get
+          existing
+        else
+          # Rare case: channel was cleared, return our new channel
+          new_channel
+        end
       end
     end
 

@@ -106,16 +106,17 @@ module Lavinmq
       begin
         # Get dedicated channel for this consumer
         conn = @connection_manager.connection
-        @channel = conn.channel
+        ch = conn.channel
+        @channel = ch
 
         # Set prefetch
-        @channel.not_nil!.prefetch(@prefetch)
+        ch.prefetch(@prefetch)
 
         # Subscribe to queue
         tag = "consumer-#{@queue_name}-#{Random.rand(10000)}"
         @consumer_tag = tag
 
-        @channel.not_nil!.basic_consume(
+        ch.basic_consume(
           @queue_name,
           tag: tag,
           no_ack: @no_ack,

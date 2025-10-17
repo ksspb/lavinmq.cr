@@ -16,15 +16,18 @@ describe Lavinmq::Client do
       client.close
     end
 
-    it "exposes connection_manager for observability" do
-      client = Lavinmq::Client.new("amqp://localhost")
-      client.connection_manager.should_not be_nil
-      client.connection_manager.should be_a(Lavinmq::ConnectionManager)
+    it "exposes connection_pool for observability and health monitoring" do
+      client = Lavinmq::Client.new("amqp://localhost", pool_size: 5)
+      client.connection_pool.should_not be_nil
+      client.connection_pool.should be_a(Lavinmq::ConnectionPool)
 
-      # Verify we can set callbacks
-      client.connection_manager.on_state_change do |state|
-        # Callback works
-      end
+      # Verify pool configuration
+      client.pool_size.should eq(5)
+      client.healthy_connections.should be >= 0
+      client.healthy?.should be_a(Bool)
+
+      # Verify we can access individual connection managers
+      client.connection_pool.connection_manager(0).should be_a(Lavinmq::ConnectionManager)
 
       client.close
     end

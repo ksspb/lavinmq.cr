@@ -63,7 +63,7 @@ module Lavinmq
       # Atomically set state to Closed
       @state.set(Config::ConnectionState::Closed.value)
 
-      @reconnect_fiber.try do |fiber|
+      @reconnect_fiber.try do
         # Signal fiber to stop (it will check @closed)
       end
 
