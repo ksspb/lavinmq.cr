@@ -37,6 +37,8 @@ module Lavinmq
       Closed
       # Message TTL expired
       TTLExpired
+      # Message failed to flush after max retries
+      FlushRetryExceeded
     end
 
     # Default buffer size for both modes (10k messages)

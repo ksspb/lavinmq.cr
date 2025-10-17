@@ -3,6 +3,9 @@ module Lavinmq
   class Producer
     Log = ::Log.for(self)
 
+    # Maximum number of flush retry attempts before dropping a message
+    MAX_FLUSH_RETRIES = 3
+
     @mode : Config::PublishMode
     @buffer_policy : Config::BufferPolicy
     @buffer : MessageBuffer
@@ -12,6 +15,7 @@ module Lavinmq
     @closed : Bool = false
     @mutex : Mutex
     @flush_fiber : Fiber?
+    @retry_counts : Hash(String, Int32) = Hash(String, Int32).new
 
     # Observability callbacks
     @on_drop : Proc(String, String, Config::DropReason, Nil)?
@@ -166,12 +170,20 @@ module Lavinmq
     end
 
     private def get_or_create_channel : AMQP::Client::Channel
+      # Check if we have a cached channel and if it's still open
       if ch = @channel
-        return ch
+        unless ch.closed?
+          return ch
+        end
+        # Channel is closed, clear cache and create new one
+        Log.debug { "Cached channel is closed, creating new channel" }
+        @channel = nil
       end
 
+      # Create new channel
       conn = @connection_manager.connection
       @channel = conn.channel
+      Log.debug { "Created new channel for queue: #{@queue_name}" }
       @channel.not_nil!
     end
 
@@ -191,9 +203,27 @@ module Lavinmq
         messages.each do |msg|
           begin
             send_message(msg)
+            # Success - clear retry count for this message
+            @retry_counts.delete(msg)
           rescue ex
-            Log.error(exception: ex) { "Failed to flush message, re-buffering" }
-            @buffer.enqueue(msg)
+            # Increment retry count for this message
+            retry_count = @retry_counts.fetch(msg, 0) + 1
+            @retry_counts[msg] = retry_count
+
+            if retry_count >= MAX_FLUSH_RETRIES
+              # Exceeded max retries - drop the message
+              Log.error(exception: ex) { "Message failed after #{retry_count} flush attempts, dropping" }
+              @retry_counts.delete(msg)
+              @on_drop.try &.call(msg, @queue_name, Config::DropReason::FlushRetryExceeded)
+            else
+              # Re-buffer for another attempt
+              Log.warn(exception: ex) { "Failed to flush message (attempt #{retry_count}/#{MAX_FLUSH_RETRIES}), re-buffering" }
+              @buffer.enqueue(msg)
+            end
+
+            # Clear the cached channel to force recreation on next attempt
+            @channel.try &.close rescue nil
+            @channel = nil
           end
         end
       end

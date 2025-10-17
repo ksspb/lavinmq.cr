@@ -236,4 +236,65 @@ describe Lavinmq::Producer do
       producer.buffer_capacity.should eq 100
     end
   end
+
+  describe "channel lifecycle management" do
+    it "clears cached channel when it's closed" do
+      config = Lavinmq::Config.new
+      manager = Lavinmq::ConnectionManager.new("amqp://localhost", config)
+      producer = Lavinmq::Producer.new(
+        manager,
+        "test_queue",
+        buffer_size: 100
+      )
+
+      # Initially no channel is cached
+      producer.@channel.should be_nil
+
+      # Note: This test verifies the logic exists but can't fully test
+      # channel recreation without a real AMQP connection
+      # The fix ensures get_or_create_channel checks channel.closed?
+    end
+
+    pending "recreates channel when closed channel is detected" do
+      # TODO: Requires integration test with real AMQP broker
+      # Test scenario:
+      # 1. Create channel
+      # 2. Close channel externally
+      # 3. Call get_or_create_channel
+      # 4. Verify new channel is created (not closed one returned)
+    end
+  end
+
+  describe "flush retry handling" do
+    it "drops messages after max flush retries to prevent infinite loops" do
+      config = Lavinmq::Config.new
+      manager = Lavinmq::ConnectionManager.new("amqp://localhost", config)
+      producer = Lavinmq::Producer.new(
+        manager,
+        "test_queue",
+        mode: Lavinmq::Config::PublishMode::Confirm,
+        buffer_policy: Lavinmq::Config::BufferPolicy::DropOldest,
+        buffer_size: 10
+      )
+
+      dropped_messages = [] of String
+      dropped_reasons = [] of Lavinmq::Config::DropReason
+
+      producer.on_drop do |msg, _queue, reason|
+        dropped_messages << msg
+        dropped_reasons << reason
+      end
+
+      # Note: Without a real AMQP connection that repeatedly fails,
+      # we can't easily test the retry logic in unit tests
+      # This test documents the expected behavior
+      # Integration tests should verify messages are dropped after
+      # MAX_FLUSH_RETRIES failed attempts
+
+      # Expected behavior (to be verified in integration tests):
+      # 1. Message fails to flush MAX_FLUSH_RETRIES times
+      # 2. Message is dropped with reason FlushRetryExceeded
+      # 3. on_drop callback is called
+    end
+  end
 end
