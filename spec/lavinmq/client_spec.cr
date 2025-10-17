@@ -15,6 +15,19 @@ describe Lavinmq::Client do
       client.should_not be_nil
       client.close
     end
+
+    it "exposes connection_manager for observability" do
+      client = Lavinmq::Client.new("amqp://localhost")
+      client.connection_manager.should_not be_nil
+      client.connection_manager.should be_a(Lavinmq::ConnectionManager)
+
+      # Verify we can set callbacks
+      client.connection_manager.on_state_change do |state|
+        # Callback works
+      end
+
+      client.close
+    end
   end
 
   describe "producer creation" do

@@ -19,7 +19,8 @@ module Lavinmq
   class Client
     Log = ::Log.for(self)
 
-    @connection_manager : ConnectionManager
+    getter connection_manager : ConnectionManager
+
     @config : Config
     @producers : Array(Producer)
     @consumers : Array(Consumer)
