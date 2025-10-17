@@ -1,0 +1,13 @@
+name: lavinmq
+version: 0.1.0
+
+authors:
+  - Sergey Konopatov <ksspb@me.com>
+
+crystal: '>= 1.17.1'
+
+license: MIT
+
+dependencies:
+  amqp-client:
+    github: cloudamqp/amqp-client.cr
