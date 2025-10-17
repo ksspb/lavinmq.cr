@@ -24,7 +24,8 @@ A robust, production-ready Crystal client library for LavinMQ/RabbitMQ with auto
 ```yaml
 dependencies:
   lavinmq:
-    github: yourname/lavinmq
+    github: ksspb/lavinmq.cr
+    version: ~> 0.1.0
   amqp-client:
     github: cloudamqp/amqp-client.cr
 ```
@@ -233,7 +234,7 @@ MIT License - see LICENSE file for details
 
 ## Contributors
 
-- [Sergey Konopatov](https://github.com/your-github-user) - creator and maintainer
+- [Sergey Konopatov](https://github.com/ksspb) - creator and maintainer
 
 ## Support
 
