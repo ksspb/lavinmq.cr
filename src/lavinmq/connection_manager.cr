@@ -123,9 +123,23 @@ module Lavinmq
       loop do
         break if @closed
 
+        # Calculate backoff delay before this attempt (except for initial connection)
+        if attempt > 0
+          delay = [@config.reconnect_initial_delay * (@config.reconnect_multiplier ** (attempt - 1)),
+                   @config.reconnect_max_delay].min
+        else
+          delay = 0.0 # No delay for initial connection
+        end
+
         begin
           # Notify reconnect attempt
           @on_reconnect_attempt.try &.call(attempt, delay)
+
+          # Sleep if needed (backoff delay)
+          if delay > 0
+            Log.info { "Reconnecting in #{delay}s..." }
+            sleep delay.seconds
+          end
 
           # Attempt connection
           Log.info { "Connecting to #{@amqp_url} (attempt #{attempt + 1})" }
@@ -150,14 +164,20 @@ module Lavinmq
 
           Log.info { "Connected successfully" }
 
-          # Monitor connection - wait until it closes
+          # Reset attempt counter after successful connection
+          attempt = 0
+          delay = @config.reconnect_initial_delay
+
+          # Monitor connection - wait until it closes (check every 100ms for fast detection)
           loop do
             break if @closed
             break if connection.closed?
-            sleep 1.second
+            sleep 100.milliseconds
           end
 
-          # Connection lost or closed, prepare to reconnect
+          break if @closed # Exit if intentionally closed
+
+          # Connection lost, prepare to reconnect
           @mutex.synchronize do
             @connection = nil
             @state = Config::ConnectionState::Reconnecting
@@ -166,22 +186,15 @@ module Lavinmq
           # Notify state change
           @on_state_change.try &.call(Config::ConnectionState::Reconnecting)
 
-          @on_disconnect.try &.call unless @closed
+          @on_disconnect.try &.call
 
-          attempt += 1
+          # Small delay before first reconnection attempt after connection loss
+          sleep 100.milliseconds
+          attempt = 1 # Start with attempt 1 after disconnect
         rescue ex
           Log.error(exception: ex) { "Connection failed: #{ex.message}" }
 
           @on_error.try &.call(ex)
-
-          attempt += 1
-
-          # Calculate backoff delay
-          delay = [@config.reconnect_initial_delay * (@config.reconnect_multiplier ** attempt),
-                   @config.reconnect_max_delay].min
-
-          Log.info { "Reconnecting in #{delay}s..." }
-          sleep delay.seconds
 
           @mutex.synchronize do
             @state = Config::ConnectionState::Reconnecting
@@ -189,6 +202,9 @@ module Lavinmq
 
           # Notify state change
           @on_state_change.try &.call(Config::ConnectionState::Reconnecting)
+
+          # Increment attempt for next retry
+          attempt += 1
         end
       end
     end
