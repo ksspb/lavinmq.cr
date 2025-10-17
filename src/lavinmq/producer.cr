@@ -11,9 +11,9 @@ module Lavinmq
     @buffer : MessageBuffer
     @connection_manager : ConnectionManager
     @queue_name : String
-    @channel : AMQP::Client::Channel?
-    @closed : Bool = false
-    @mutex : Mutex
+    @channel : Atomic(AMQP::Client::Channel?)
+    @closed : Atomic(Bool)
+    @mutex : Mutex  # Still needed for flush_buffered_messages
     @flush_fiber : Fiber?
     @retry_counts : Hash(String, Int32) = Hash(String, Int32).new
 
@@ -32,6 +32,8 @@ module Lavinmq
     )
       @buffer = MessageBuffer.new(buffer_size)
       @mutex = Mutex.new
+      @channel = Atomic(AMQP::Client::Channel?).new(nil)
+      @closed = Atomic(Bool).new(false)
 
       # Start flush fiber to send buffered messages
       @flush_fiber = spawn { flush_loop }
@@ -44,20 +46,24 @@ module Lavinmq
 
     # Publish a message (non-blocking, zero latency)
     def publish(message : String) : Nil
-      return if @closed
+      return if @closed.get
 
-      # Optimistic fast path: try cached channel if available
-      if ch = @channel
+      # Optimistic fast path: try cached channel if available (lock-free atomic load)
+      if ch = @channel.get
         unless ch.closed?
           begin
             # Fast path: use cached channel without connection retrieval
             send_message_fast(ch, message)
             return
           rescue ex
-            # Channel failed, clear cache and fall through to queue
+            # Channel failed, atomically clear cache and fall through to queue
             Log.debug(exception: ex) { "Fast path failed, queuing message" }
-            @channel = nil
+            # Use compare_and_set to only clear if it's still the same channel
+            @channel.compare_and_set(ch, nil)
           end
+        else
+          # Channel is closed, atomically clear it
+          @channel.compare_and_set(ch, nil)
         end
       end
 
@@ -67,17 +73,16 @@ module Lavinmq
 
     # Close producer
     def close : Nil
-      return if @closed
-
-      @mutex.synchronize do
-        @closed = true
-      end
+      # Atomically set closed flag - prevents TOCTOU bug
+      return unless @closed.compare_and_set(false, true)
 
       # Flush remaining messages
       flush_buffered_messages
 
-      @channel.try &.close rescue nil
-      @channel = nil
+      # Atomically clear and close channel
+      if ch = @channel.swap(nil)
+        ch.close rescue nil
+      end
 
       Log.info { "Producer closed for queue: #{@queue_name}" }
     end
@@ -173,33 +178,50 @@ module Lavinmq
     end
 
     private def get_or_create_channel : AMQP::Client::Channel
-      # Check if we have a cached channel and if it's still open
-      if ch = @channel
+      # Check if we have a cached channel and if it's still open (atomic load)
+      if ch = @channel.get
         unless ch.closed?
           return ch
         end
-        # Channel is closed, clear cache and create new one
+        # Channel is closed, atomically clear cache
         Log.debug { "Cached channel is closed, creating new channel" }
-        @channel = nil
+        @channel.compare_and_set(ch, nil)
       end
 
       # Try non-blocking connection first
       if conn = @connection_manager.connection?
-        @channel = conn.channel
+        new_channel = conn.channel
         Log.debug { "Created new channel for queue: #{@queue_name}" }
-        return @channel.not_nil!
+
+        # Atomically set the new channel only if it's still nil
+        # This prevents multiple fibers from creating duplicate channels
+        if @channel.compare_and_set(nil, new_channel)
+          return new_channel
+        else
+          # Another fiber already created a channel, close ours and use theirs
+          new_channel.close rescue nil
+          return @channel.get.not_nil!
+        end
       end
 
       # Fallback to blocking connection (only used by background flush)
       conn = @connection_manager.connection
-      @channel = conn.channel
+      new_channel = conn.channel
       Log.debug { "Created new channel for queue: #{@queue_name}" }
-      @channel.not_nil!
+
+      # Same atomic set logic for blocking path
+      if @channel.compare_and_set(nil, new_channel)
+        return new_channel
+      else
+        # Another fiber already created a channel
+        new_channel.close rescue nil
+        return @channel.get.not_nil!
+      end
     end
 
     private def flush_loop : Nil
       loop do
-        break if @closed
+        break if @closed.get
         sleep 100.milliseconds # Fast flush for low latency
         flush_buffered_messages if has_connection?
       end
@@ -231,9 +253,10 @@ module Lavinmq
               @buffer.enqueue(msg)
             end
 
-            # Clear the cached channel to force recreation on next attempt
-            @channel.try &.close rescue nil
-            @channel = nil
+            # Atomically clear and close the cached channel to force recreation on next attempt
+            if old_ch = @channel.swap(nil)
+              old_ch.close rescue nil
+            end
           end
         end
       end
