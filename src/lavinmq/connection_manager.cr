@@ -91,6 +91,11 @@ module Lavinmq
       raise ClosedError.new("Connection not available")
     end
 
+    # Get current connection without blocking (returns nil if not connected)
+    def connection? : AMQP::Client::Connection?
+      @connection
+    end
+
     # Set connection callback
     def on_connect(&block : ->)
       @on_connect = block

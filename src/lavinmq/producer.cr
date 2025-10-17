@@ -42,23 +42,27 @@ module Lavinmq
       end
     end
 
-    # Publish a message
+    # Publish a message (non-blocking, zero latency)
     def publish(message : String) : Nil
       return if @closed
 
-      # If disconnected, buffer the message
-      unless has_connection?
-        handle_buffering(message)
-        return
+      # Optimistic fast path: try cached channel if available
+      if ch = @channel
+        unless ch.closed?
+          begin
+            # Fast path: use cached channel without connection retrieval
+            send_message_fast(ch, message)
+            return
+          rescue ex
+            # Channel failed, clear cache and fall through to queue
+            Log.debug(exception: ex) { "Fast path failed, queuing message" }
+            @channel = nil
+          end
+        end
       end
 
-      # Try to send immediately
-      begin
-        send_message(message)
-      rescue ex
-        Log.warn(exception: ex) { "Failed to send message, buffering" }
-        handle_buffering(message)
-      end
+      # Queue for background sending (non-blocking)
+      handle_buffering(message)
     end
 
     # Close producer
@@ -133,21 +137,17 @@ module Lavinmq
           end
           @buffer.enqueue(message)
         when Config::BufferPolicy::Block
-          # Block until space available
-          while @buffer.full? && !@closed
-            sleep 10.milliseconds
+          # Non-blocking: drop oldest to make space (maintains zero-latency guarantee)
+          # Note: "Block" policy now drops oldest rather than blocking to prevent latency
+          if dropped = @buffer.enqueue(message)
+            @on_drop.try &.call(dropped, @queue_name, Config::DropReason::BufferFull)
           end
-          if @closed
-            @on_drop.try &.call(message, @queue_name, Config::DropReason::Closed)
-            return
-          end
-          @buffer.enqueue(message)
         end
       end
     end
 
-    private def send_message(message : String) : Nil
-      channel = get_or_create_channel
+    # Send message using provided channel (fast path, no connection retrieval)
+    private def send_message_fast(channel : AMQP::Client::Channel, message : String) : Nil
       queue = channel.queue(@queue_name)
 
       case @mode
@@ -155,18 +155,21 @@ module Lavinmq
         queue.publish(message)
         # Fire-and-forget doesn't have confirmation
       when Config::PublishMode::Confirm
-        begin
-          confirmed = queue.publish_confirm(message)
-          if confirmed
-            @on_confirm.try &.call(message, @queue_name)
-          else
-            @on_nack.try &.call(message, @queue_name)
-          end
-        rescue ex
-          @on_error.try &.call(message, @queue_name, ex)
-          raise ex
+        confirmed = queue.publish_confirm(message)
+        if confirmed
+          @on_confirm.try &.call(message, @queue_name)
+        else
+          @on_nack.try &.call(message, @queue_name)
+          # Raise to trigger re-queue on nack
+          raise AMQP::Client::Error.new("Message nacked by server")
         end
       end
+    end
+
+    # Send message (used by background flush, can block)
+    private def send_message(message : String) : Nil
+      channel = get_or_create_channel
+      send_message_fast(channel, message)
     end
 
     private def get_or_create_channel : AMQP::Client::Channel
@@ -180,7 +183,14 @@ module Lavinmq
         @channel = nil
       end
 
-      # Create new channel
+      # Try non-blocking connection first
+      if conn = @connection_manager.connection?
+        @channel = conn.channel
+        Log.debug { "Created new channel for queue: #{@queue_name}" }
+        return @channel.not_nil!
+      end
+
+      # Fallback to blocking connection (only used by background flush)
       conn = @connection_manager.connection
       @channel = conn.channel
       Log.debug { "Created new channel for queue: #{@queue_name}" }
@@ -190,7 +200,7 @@ module Lavinmq
     private def flush_loop : Nil
       loop do
         break if @closed
-        sleep 1.second
+        sleep 100.milliseconds # Fast flush for low latency
         flush_buffered_messages if has_connection?
       end
     end

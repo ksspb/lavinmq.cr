@@ -118,7 +118,7 @@ describe Lavinmq::Producer do
       dropped_reasons.should eq [Lavinmq::Config::DropReason::BufferFull]
     end
 
-    it "calls on_drop callback when producer is closed with Block policy" do
+    it "calls on_drop callback when buffer is full (Block policy now drops oldest for zero-latency)" do
       config = Lavinmq::Config.new
       manager = Lavinmq::ConnectionManager.new("amqp://localhost", config)
       producer = Lavinmq::Producer.new(
@@ -140,17 +140,11 @@ describe Lavinmq::Producer do
       # Fill the buffer first
       producer.publish("msg1")
 
-      # Now try to publish while buffer is full and then close
-      spawn do
-        sleep 10.milliseconds
-        producer.close
-      end
-
-      # This should block then get dropped due to close
+      # Block policy now drops oldest (msg1) when buffer full (zero-latency requirement)
       producer.publish("msg2")
 
-      dropped_messages.should eq ["msg2"]
-      dropped_reasons.should eq [Lavinmq::Config::DropReason::Closed]
+      dropped_messages.should eq ["msg1"]
+      dropped_reasons.should eq [Lavinmq::Config::DropReason::BufferFull]
     end
   end
 
