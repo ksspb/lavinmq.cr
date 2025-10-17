@@ -16,6 +16,8 @@ module Lavinmq
     @on_connect : Proc(Nil)?
     @on_disconnect : Proc(Nil)?
     @on_error : Proc(Exception, Nil)?
+    @on_state_change : Proc(Config::ConnectionState, Nil)?
+    @on_reconnect_attempt : Proc(Int32, Float64, Nil)?
 
     def initialize(@amqp_url : String, @config : Config = Config.new)
       @mutex = Mutex.new
@@ -104,6 +106,16 @@ module Lavinmq
       @on_error = block
     end
 
+    # Set state change callback
+    def on_state_change(&block : Config::ConnectionState ->)
+      @on_state_change = block
+    end
+
+    # Set reconnect attempt callback
+    def on_reconnect_attempt(&block : Int32, Float64 ->)
+      @on_reconnect_attempt = block
+    end
+
     private def reconnect_loop
       attempt = 0
       delay = @config.reconnect_initial_delay
@@ -112,6 +124,9 @@ module Lavinmq
         break if @closed
 
         begin
+          # Notify reconnect attempt
+          @on_reconnect_attempt.try &.call(attempt, delay)
+
           # Attempt connection
           Log.info { "Connecting to #{@amqp_url} (attempt #{attempt + 1})" }
 
@@ -123,6 +138,9 @@ module Lavinmq
             @connection = connection
             @state = Config::ConnectionState::Connected
           end
+
+          # Notify state change
+          @on_state_change.try &.call(Config::ConnectionState::Connected)
 
           # Notify waiters
           @state_channel.send(Config::ConnectionState::Connected) rescue nil
@@ -145,6 +163,9 @@ module Lavinmq
             @state = Config::ConnectionState::Reconnecting
           end
 
+          # Notify state change
+          @on_state_change.try &.call(Config::ConnectionState::Reconnecting)
+
           @on_disconnect.try &.call unless @closed
 
           attempt += 1
@@ -165,6 +186,9 @@ module Lavinmq
           @mutex.synchronize do
             @state = Config::ConnectionState::Reconnecting
           end
+
+          # Notify state change
+          @on_state_change.try &.call(Config::ConnectionState::Reconnecting)
         end
       end
     end

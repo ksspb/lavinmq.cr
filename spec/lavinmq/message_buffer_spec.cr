@@ -54,4 +54,34 @@ describe Lavinmq::MessageBuffer do
       buffer.count.should eq 100
     end
   end
+
+  describe "observability: buffer state" do
+    it "exposes buffer size and capacity" do
+      buffer = Lavinmq::MessageBuffer.new(max_size: 10)
+
+      buffer.size.should eq 0
+      buffer.capacity.should eq 10
+
+      buffer.enqueue("msg1")
+      buffer.enqueue("msg2")
+
+      buffer.size.should eq 2
+      buffer.capacity.should eq 10
+    end
+
+    it "reports empty and full states" do
+      buffer = Lavinmq::MessageBuffer.new(max_size: 2)
+
+      buffer.empty?.should be_true
+      buffer.full?.should be_false
+
+      buffer.enqueue("msg1")
+      buffer.empty?.should be_false
+      buffer.full?.should be_false
+
+      buffer.enqueue("msg2")
+      buffer.empty?.should be_false
+      buffer.full?.should be_true
+    end
+  end
 end

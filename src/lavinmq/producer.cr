@@ -13,6 +13,12 @@ module Lavinmq
     @mutex : Mutex
     @flush_fiber : Fiber?
 
+    # Observability callbacks
+    @on_drop : Proc(String, String, Config::DropReason, Nil)?
+    @on_confirm : Proc(String, String, Nil)?
+    @on_nack : Proc(String, String, Nil)?
+    @on_error : Proc(String, String, Exception, Nil)?
+
     def initialize(
       @connection_manager : ConnectionManager,
       @queue_name : String,
@@ -68,6 +74,36 @@ module Lavinmq
       Log.info { "Producer closed for queue: #{@queue_name}" }
     end
 
+    # Set callback for message drops
+    def on_drop(&block : String, String, Config::DropReason ->)
+      @on_drop = block
+    end
+
+    # Set callback for confirmed messages
+    def on_confirm(&block : String, String ->)
+      @on_confirm = block
+    end
+
+    # Set callback for nacked messages
+    def on_nack(&block : String, String ->)
+      @on_nack = block
+    end
+
+    # Set callback for publish errors
+    def on_error(&block : String, String, Exception ->)
+      @on_error = block
+    end
+
+    # Get current buffer size
+    def buffer_size : Int32
+      @buffer.size
+    end
+
+    # Get buffer capacity
+    def buffer_capacity : Int32
+      @buffer.capacity
+    end
+
     private def has_connection? : Bool
       @connection_manager.state == Config::ConnectionState::Connected
     end
@@ -76,14 +112,19 @@ module Lavinmq
       case @mode
       when Config::PublishMode::FireAndForget
         # Fire-and-forget: buffer and drop oldest if full
-        @buffer.enqueue(message)
+        if dropped = @buffer.enqueue(message)
+          @on_drop.try &.call(dropped, @queue_name, Config::DropReason::BufferFull)
+        end
       when Config::PublishMode::Confirm
         # Confirm mode: apply buffer policy
         case @buffer_policy
         when Config::BufferPolicy::DropOldest
-          @buffer.enqueue(message)
+          if dropped = @buffer.enqueue(message)
+            @on_drop.try &.call(dropped, @queue_name, Config::DropReason::BufferFull)
+          end
         when Config::BufferPolicy::Raise
           if @buffer.full?
+            @on_drop.try &.call(message, @queue_name, Config::DropReason::BufferFull)
             raise BufferFullError.new("Producer buffer full for queue: #{@queue_name}")
           end
           @buffer.enqueue(message)
@@ -92,7 +133,11 @@ module Lavinmq
           while @buffer.full? && !@closed
             sleep 10.milliseconds
           end
-          @buffer.enqueue(message) unless @closed
+          if @closed
+            @on_drop.try &.call(message, @queue_name, Config::DropReason::Closed)
+            return
+          end
+          @buffer.enqueue(message)
         end
       end
     end
@@ -104,8 +149,19 @@ module Lavinmq
       case @mode
       when Config::PublishMode::FireAndForget
         queue.publish(message)
+        # Fire-and-forget doesn't have confirmation
       when Config::PublishMode::Confirm
-        queue.publish_confirm(message)
+        begin
+          confirmed = queue.publish_confirm(message)
+          if confirmed
+            @on_confirm.try &.call(message, @queue_name)
+          else
+            @on_nack.try &.call(message, @queue_name)
+          end
+        rescue ex
+          @on_error.try &.call(message, @queue_name, ex)
+          raise ex
+        end
       end
     end
 

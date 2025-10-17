@@ -27,6 +27,18 @@ module Lavinmq
       Closed
     end
 
+    # Reason for message drop
+    enum DropReason
+      # Connection lost, message buffered then dropped
+      Disconnected
+      # Buffer at capacity, oldest message dropped
+      BufferFull
+      # Producer/client closed, message dropped
+      Closed
+      # Message TTL expired
+      TTLExpired
+    end
+
     # Default buffer size for both modes (10k messages)
     DEFAULT_BUFFER_SIZE = 10_000
 

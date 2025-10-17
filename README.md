@@ -16,6 +16,7 @@ A robust, production-ready Crystal client library for LavinMQ/RabbitMQ with auto
 - 🧵 **Multi-fiber Safe** - All operations are fiber-safe with proper synchronization
 - ✅ **Independent Ack Tracking** - Each consumer gets dedicated channel with separate ack tracking
 - 🔌 **Auto-recovery** - Consumers and producers automatically recover after reconnection
+- 📊 **Observability Hooks** - Built-in callbacks for Prometheus metrics and monitoring
 
 ## Installation
 
@@ -152,6 +153,102 @@ consumer.ack(delivery_tag, multiple: true)
 # Nack multiple messages
 consumer.nack(delivery_tag, multiple: true, requeue: true)
 ```
+
+## Observability & Monitoring
+
+The library provides comprehensive observability hooks for tracking metrics with Prometheus or other monitoring systems.
+
+### Publisher Outcome Callbacks
+
+Track message confirmations, nacks, and errors:
+
+```crystal
+producer = client.producer("orders", mode: :confirm)
+
+# Track confirmations
+producer.on_confirm do |message, queue_name|
+  PROMETHEUS.increment("amqp_messages_total", {"queue" => queue_name, "result" => "confirmed"})
+end
+
+# Track nacks
+producer.on_nack do |message, queue_name|
+  PROMETHEUS.increment("amqp_messages_total", {"queue" => queue_name, "result" => "nack"})
+end
+
+# Track errors
+producer.on_error do |message, queue_name, exception|
+  PROMETHEUS.increment("amqp_messages_total", {"queue" => queue_name, "result" => "error"})
+  Log.error(exception: exception) { "Publish failed for #{queue_name}" }
+end
+```
+
+### Drop Tracking with Reasons
+
+Track message drops with detailed reasons:
+
+```crystal
+producer.on_drop do |message, queue_name, reason|
+  reason_label = case reason
+                 when Lavinmq::Config::DropReason::BufferFull
+                   "buffer_full"
+                 when Lavinmq::Config::DropReason::Disconnected
+                   "disconnected"
+                 when Lavinmq::Config::DropReason::Closed
+                   "closed"
+                 when Lavinmq::Config::DropReason::TTLExpired
+                   "ttl_expired"
+                 end
+
+  PROMETHEUS.increment("amqp_messages_dropped_total", {
+    "queue" => queue_name,
+    "reason" => reason_label
+  })
+end
+```
+
+### Buffer State Exposure
+
+Monitor real-time buffer depth:
+
+```crystal
+# Expose buffer metrics periodically
+spawn do
+  loop do
+    PROMETHEUS.set_gauge("amqp_buffer_depth", producer.buffer_size, {"queue" => "orders"})
+    PROMETHEUS.set_gauge("amqp_buffer_capacity", producer.buffer_capacity, {"queue" => "orders"})
+    sleep 5.seconds
+  end
+end
+```
+
+### Connection State Callbacks
+
+Track connection state changes and reconnection attempts:
+
+```crystal
+# Track state changes
+client.connection_manager.on_state_change do |state|
+  state_value = case state
+                when Lavinmq::Config::ConnectionState::Connected
+                  1
+                when Lavinmq::Config::ConnectionState::Disconnected,
+                     Lavinmq::Config::ConnectionState::Reconnecting
+                  0
+                end
+
+  PROMETHEUS.set_gauge("amqp_connection_state", state_value)
+end
+
+# Track reconnection attempts
+client.connection_manager.on_reconnect_attempt do |attempt, delay|
+  PROMETHEUS.increment("amqp_reconnection_attempts_total", {"attempt" => attempt.to_s})
+  Log.warn { "Reconnection attempt #{attempt + 1}, delay: #{delay}s" }
+end
+```
+
+### Complete Example
+
+See `examples/observability_prometheus.cr` for a complete working example of integrating with Prometheus metrics.
 
 ## Architecture
 

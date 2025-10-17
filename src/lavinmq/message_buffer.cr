@@ -14,17 +14,19 @@ module Lavinmq
     end
 
     # Add message to buffer
-    # If buffer is full, drops the oldest message
-    def enqueue(message : String) : Bool
+    # If buffer is full, drops the oldest message and returns it
+    # Returns nil if no message was dropped
+    def enqueue(message : String) : String?
       @mutex.synchronize do
+        dropped = nil
         if @buffer.size >= @max_size
           # Ring buffer: drop oldest, accept new
           @dropped_count += 1
-          @buffer.shift # Remove oldest
+          dropped = @buffer.shift # Remove and return oldest
         end
 
         @buffer << message
-        true
+        dropped
       end
     end
 
@@ -57,6 +59,16 @@ module Lavinmq
     # Get current buffer count
     def count : Int32
       @mutex.synchronize { @buffer.size }
+    end
+
+    # Alias for count (observability API)
+    def size : Int32
+      count
+    end
+
+    # Get buffer capacity
+    def capacity : Int32
+      @max_size
     end
 
     # Clear all messages
