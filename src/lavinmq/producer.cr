@@ -13,7 +13,7 @@ module Lavinmq
     @queue_name : String
     @channel : Atomic(AMQP::Client::Channel?)
     @closed : Atomic(Bool)
-    @mutex : Mutex  # Still needed for flush_buffered_messages
+    @mutex : Mutex # Still needed for flush_buffered_messages
     @flush_fiber : Fiber?
     @retry_counts : Hash(String, Int32) = Hash(String, Int32).new
 
@@ -50,7 +50,10 @@ module Lavinmq
 
       # Optimistic fast path: try cached channel if available (lock-free atomic load)
       if ch = @channel.get
-        unless ch.closed?
+        if ch.closed?
+          # Channel is closed, atomically clear it
+          @channel.compare_and_set(ch, nil)
+        else
           begin
             # Fast path: use cached channel without connection retrieval
             send_message_fast(ch, message)
@@ -61,9 +64,6 @@ module Lavinmq
             # Use compare_and_set to only clear if it's still the same channel
             @channel.compare_and_set(ch, nil)
           end
-        else
-          # Channel is closed, atomically clear it
-          @channel.compare_and_set(ch, nil)
         end
       end
 
@@ -211,11 +211,11 @@ module Lavinmq
 
       # Same atomic set logic for blocking path
       if @channel.compare_and_set(nil, new_channel)
-        return new_channel
+        new_channel
       else
         # Another fiber already created a channel
         new_channel.close rescue nil
-        return @channel.get.not_nil!
+        @channel.get.not_nil!
       end
     end
 

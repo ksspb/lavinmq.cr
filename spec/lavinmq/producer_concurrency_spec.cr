@@ -100,7 +100,7 @@ describe "Lavinmq::Producer Concurrency" do
 
       # The current implementation won't achieve high throughput
       # due to mutex contention
-      throughput.should be > 0  # Basic check - it works but slowly
+      throughput.should be > 0 # Basic check - it works but slowly
 
       producer.close
       conn_mgr.close
@@ -183,7 +183,7 @@ describe "Lavinmq::Producer Concurrency" do
       errors = Atomic(Int32).new(0)
 
       # Set drop callback
-      producer.on_drop do |msg, queue, reason|
+      producer.on_drop do |_msg, _queue, _reason|
         dropped.add(1)
       end
 

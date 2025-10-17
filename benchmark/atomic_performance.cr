@@ -44,7 +44,7 @@ class AtomicProducerBenchmark
       end
 
       throughput = total_messages / elapsed.total_seconds
-      latency_per_msg = (elapsed.total_seconds / total_messages) * 1_000_000  # in microseconds
+      latency_per_msg = (elapsed.total_seconds / total_messages) * 1_000_000 # in microseconds
 
       puts "  Time: #{(elapsed.total_milliseconds).round(2)}ms"
       puts "  Throughput: #{throughput.round(0)} msg/sec"

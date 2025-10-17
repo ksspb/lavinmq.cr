@@ -1,16 +1,16 @@
 module Lavinmq
-  # Manages AMQP connection with automatic reconnection
+  # Manages AMQP connection with automatic reconnection using atomic operations
+  # Provides thread-safe state management without mutex overhead
   class ConnectionManager
     Log = ::Log.for(self)
 
-    @state : Config::ConnectionState = Config::ConnectionState::Connecting
-    @connection : AMQP::Client::Connection?
+    @state : Atomic(Int32) # Use Int32 for atomic enum representation
+    @connection : Atomic(AMQP::Client::Connection?)
     @amqp_url : String
     @config : Config
-    @mutex : Mutex
     @state_channel : Channel(Config::ConnectionState)
     @reconnect_fiber : Fiber?
-    @closed = false
+    @closed : Atomic(Bool)
 
     # Callbacks
     @on_connect : Proc(Nil)?
@@ -20,19 +20,24 @@ module Lavinmq
     @on_reconnect_attempt : Proc(Int32, Float64, Nil)?
 
     def initialize(@amqp_url : String, @config : Config = Config.new)
-      @mutex = Mutex.new
+      # Initialize atomics with enum values converted to Int32
+      @state = Atomic(Int32).new(Config::ConnectionState::Connecting.value)
+      @connection = Atomic(AMQP::Client::Connection?).new(nil)
+      @closed = Atomic(Bool).new(false)
       @state_channel = Channel(Config::ConnectionState).new
     end
 
     def state : Config::ConnectionState
-      @mutex.synchronize { @state }
+      # Convert atomic Int32 back to enum
+      Config::ConnectionState.from_value(@state.get)
     end
 
     # Start connection and return when connected
     def connect : Nil
-      return if @closed
+      return if @closed.get
 
-      @mutex.synchronize { @state = Config::ConnectionState::Connecting }
+      # Atomically set state to Connecting
+      @state.set(Config::ConnectionState::Connecting.value)
 
       spawn do
         reconnect_loop
@@ -52,19 +57,18 @@ module Lavinmq
 
     # Close connection
     def close : Nil
-      return if @closed
+      # Atomically set closed flag using compare-and-set to prevent TOCTOU bug
+      return unless @closed.compare_and_set(false, true)
 
-      @mutex.synchronize do
-        @closed = true
-        @state = Config::ConnectionState::Closed
-      end
+      # Atomically set state to Closed
+      @state.set(Config::ConnectionState::Closed.value)
 
       @reconnect_fiber.try do |fiber|
         # Signal fiber to stop (it will check @closed)
       end
 
-      if conn = @connection
-        @connection = nil
+      # Atomically swap connection to nil and close if exists
+      if conn = @connection.swap(nil)
         begin
           conn.close
         rescue
@@ -78,13 +82,14 @@ module Lavinmq
 
     # Get current connection (or wait for reconnection)
     def connection : AMQP::Client::Connection
-      if conn = @connection
+      # Atomic load of connection
+      if conn = @connection.get
         return conn
       end
 
       # Wait for connection to be established
       sleep 100.milliseconds
-      if conn = @connection
+      if conn = @connection.get
         return conn
       end
 
@@ -93,7 +98,7 @@ module Lavinmq
 
     # Get current connection without blocking (returns nil if not connected)
     def connection? : AMQP::Client::Connection?
-      @connection
+      @connection.get
     end
 
     # Set connection callback
@@ -126,7 +131,7 @@ module Lavinmq
       delay = @config.reconnect_initial_delay
 
       loop do
-        break if @closed
+        break if @closed.get
 
         # Calculate backoff delay before this attempt (except for initial connection)
         if attempt > 0
@@ -153,10 +158,10 @@ module Lavinmq
           client = AMQP::Client.new(@amqp_url)
           connection = client.connect
 
-          @mutex.synchronize do
-            @connection = connection
-            @state = Config::ConnectionState::Connected
-          end
+          # Atomically set connection and state
+          old_conn = @connection.swap(connection)
+          old_conn.try &.close rescue nil # Close old connection if exists
+          @state.set(Config::ConnectionState::Connected.value)
 
           # Notify state change
           @on_state_change.try &.call(Config::ConnectionState::Connected)
@@ -175,18 +180,17 @@ module Lavinmq
 
           # Monitor connection - wait until it closes (check every 100ms for fast detection)
           loop do
-            break if @closed
+            break if @closed.get
             break if connection.closed?
             sleep 100.milliseconds
           end
 
-          break if @closed # Exit if intentionally closed
+          break if @closed.get # Exit if intentionally closed
 
           # Connection lost, prepare to reconnect
-          @mutex.synchronize do
-            @connection = nil
-            @state = Config::ConnectionState::Reconnecting
-          end
+          # Only clear if it's still our connection (CAS to prevent race)
+          @connection.compare_and_set(connection, nil)
+          @state.set(Config::ConnectionState::Reconnecting.value)
 
           # Notify state change
           @on_state_change.try &.call(Config::ConnectionState::Reconnecting)
@@ -201,9 +205,8 @@ module Lavinmq
 
           @on_error.try &.call(ex)
 
-          @mutex.synchronize do
-            @state = Config::ConnectionState::Reconnecting
-          end
+          # Atomically set state to Reconnecting
+          @state.set(Config::ConnectionState::Reconnecting.value)
 
           # Notify state change
           @on_state_change.try &.call(Config::ConnectionState::Reconnecting)

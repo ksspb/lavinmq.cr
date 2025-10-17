@@ -1,49 +1,86 @@
 module Lavinmq
-  # Metrics tracking for LavinMQ client
+  # Metrics tracking for LavinMQ client using lock-free atomic operations
+  # Provides high-performance metric collection without mutex overhead
   class Metrics
-    getter messages_sent : Int64 = 0_i64
-    getter messages_received : Int64 = 0_i64
-    getter messages_dropped : Int64 = 0_i64
-    getter messages_buffered : Int32 = 0
-    getter connection_count : Int64 = 0_i64
-    getter reconnection_count : Int64 = 0_i64
-
-    @mutex : Mutex
+    @messages_sent : Atomic(Int64)
+    @messages_received : Atomic(Int64)
+    @messages_dropped : Atomic(Int64)
+    @messages_buffered : Atomic(Int32)
+    @connection_count : Atomic(Int64)
+    @reconnection_count : Atomic(Int64)
 
     def initialize
-      @mutex = Mutex.new
+      @messages_sent = Atomic(Int64).new(0_i64)
+      @messages_received = Atomic(Int64).new(0_i64)
+      @messages_dropped = Atomic(Int64).new(0_i64)
+      @messages_buffered = Atomic(Int32).new(0)
+      @connection_count = Atomic(Int64).new(0_i64)
+      @reconnection_count = Atomic(Int64).new(0_i64)
+    end
+
+    def messages_sent : Int64
+      @messages_sent.get
+    end
+
+    def messages_received : Int64
+      @messages_received.get
+    end
+
+    def messages_dropped : Int64
+      @messages_dropped.get
+    end
+
+    def messages_buffered : Int32
+      @messages_buffered.get
+    end
+
+    def connection_count : Int64
+      @connection_count.get
+    end
+
+    def reconnection_count : Int64
+      @reconnection_count.get
     end
 
     def increment_sent : Nil
-      @mutex.synchronize { @messages_sent += 1 }
+      @messages_sent.add(1_i64)
     end
 
     def increment_received : Nil
-      @mutex.synchronize { @messages_received += 1 }
+      @messages_received.add(1_i64)
     end
 
     def increment_dropped : Nil
-      @mutex.synchronize { @messages_dropped += 1 }
+      @messages_dropped.add(1_i64)
     end
 
     def update_buffered(count : Int32) : Nil
-      @mutex.synchronize { @messages_buffered = count }
+      @messages_buffered.set(count)
     end
 
     def increment_connections : Nil
-      @mutex.synchronize { @connection_count += 1 }
+      @connection_count.add(1_i64)
     end
 
     def increment_reconnections : Nil
-      @mutex.synchronize { @reconnection_count += 1 }
+      @reconnection_count.add(1_i64)
     end
 
     def to_s(io : IO) : Nil
-      @mutex.synchronize do
-        io << "Messages: sent=#{@messages_sent}, received=#{@messages_received}, "
-        io << "dropped=#{@messages_dropped}, buffered=#{@messages_buffered}, "
-        io << "Connections: count=#{@connection_count}, reconnections=#{@reconnection_count}"
-      end
+      # Atomic reads are naturally consistent
+      io << "Messages: sent=#{messages_sent}, received=#{messages_received}, "
+      io << "dropped=#{messages_dropped}, buffered=#{messages_buffered}, "
+      io << "Connections: count=#{connection_count}, reconnections=#{reconnection_count}"
+    end
+
+    # Reset all metrics to zero (useful for testing)
+    def reset : Nil
+      @messages_sent.set(0_i64)
+      @messages_received.set(0_i64)
+      @messages_dropped.set(0_i64)
+      @messages_buffered.set(0)
+      @connection_count.set(0_i64)
+      @reconnection_count.set(0_i64)
     end
   end
 end
