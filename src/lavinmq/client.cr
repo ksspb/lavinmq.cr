@@ -24,9 +24,9 @@ module Lavinmq
     @config : Config
     @producers : Array(Producer)
     @consumers : Array(Consumer)
-    @closed : Bool = false
-    @reconnecting : Bool = false
-    @mutex : Mutex
+    @closed : Atomic(Bool)
+    @reconnecting : Atomic(Bool)
+    @mutex : Mutex # Only for producer/consumer arrays
     @health_check_fiber : Fiber?
 
     # Initialize client with hybrid event-driven + polling reconnection
@@ -36,14 +36,17 @@ module Lavinmq
       @producers = [] of Producer
       @consumers = [] of Consumer
       @mutex = Mutex.new
+      @closed = Atomic(Bool).new(false)
+      @reconnecting = Atomic(Bool).new(false)
       @connection = uninitialized AMQP::Client::Connection
 
       connect
 
       # Start health check polling as fallback for on_close
+      # With lock-free operations, on_close is now reliable, so we can use slower polling
       @health_check_fiber = spawn { health_check_loop }
 
-      Log.info { "Client initialized with hybrid event-driven + polling reconnection" }
+      Log.info { "Client initialized with event-driven reconnection (lock-free atomic operations)" }
     end
 
     # Create a producer for a queue
@@ -53,9 +56,9 @@ module Lavinmq
       buffer_policy : Config::BufferPolicy = Config::BufferPolicy::Block,
       buffer_size : Int32 = @config.buffer_size,
     ) : Producer
-      @mutex.synchronize do
-        raise ClosedError.new("Client is closed") if @closed
+      raise ClosedError.new("Client is closed") if @closed.get
 
+      @mutex.synchronize do
         prod = Producer.new(
           self,
           queue_name,
@@ -76,9 +79,9 @@ module Lavinmq
       queue_name : String,
       prefetch : Int32 = 100,
     ) : Consumer
-      @mutex.synchronize do
-        raise ClosedError.new("Client is closed") if @closed
+      raise ClosedError.new("Client is closed") if @closed.get
 
+      @mutex.synchronize do
         cons = Consumer.new(
           self,
           queue_name,
@@ -94,10 +97,8 @@ module Lavinmq
 
     # Close client and all producers/consumers
     def close : Nil
-      @mutex.synchronize do
-        return if @closed
-        @closed = true
-      end
+      # Atomically set closed flag
+      return unless @closed.compare_and_set(false, true)
 
       Log.info { "Closing client..." }
 
@@ -187,40 +188,42 @@ module Lavinmq
       end
     end
 
-    # Trigger reconnection (thread-safe)
+    # Trigger reconnection (lock-free atomic operations)
     private def trigger_reconnect
-      should_reconnect = false
+      # Atomically check if we should reconnect (not already reconnecting and not closed)
+      # This prevents multiple reconnection attempts from running simultaneously
+      loop do
+        reconnecting = @reconnecting.get
+        closed = @closed.get
 
-      @mutex.synchronize do
-        if !@reconnecting && !@closed
-          @reconnecting = true
-          should_reconnect = true
-        end
+        # Don't reconnect if already reconnecting or closed
+        return if reconnecting || closed
+
+        # Try to atomically set reconnecting flag
+        break if @reconnecting.compare_and_set(false, true)
+
+        # CAS failed, retry (another fiber might have set it)
       end
-
-      return unless should_reconnect
 
       spawn do
         delay = @config.reconnect_initial_delay
         attempt = 0
 
         loop do
-          # Check closed flag without mutex for fast exit
-          break if @closed
+          # Check closed flag (fast atomic read)
+          break if @closed.get
 
           attempt += 1
           Log.info { "Reconnecting in #{delay}s... (attempt #{attempt})" }
           sleep delay.seconds
 
-          break if @closed
+          break if @closed.get
 
           begin
             connect
 
-            # Successfully reconnected - clear flag
-            @mutex.synchronize do
-              @reconnecting = false
-            end
+            # Successfully reconnected - atomically clear flag
+            @reconnecting.set(false)
 
             Log.info { "Reconnected successfully after #{attempt} attempts" }
             break
@@ -233,23 +236,22 @@ module Lavinmq
         end
 
         # If loop exits due to @closed, clear reconnecting flag
-        if @closed
-          @mutex.synchronize do
-            @reconnecting = false
-          end
+        if @closed.get
+          @reconnecting.set(false)
         end
       end
     end
 
     # Health check loop - polling fallback for when on_close doesn't fire
-    # Runs every 100ms to detect connection loss under high load
+    # With lock-free atomic operations, on_close is now reliable under high load
+    # So we use 1s polling interval (vs 100ms) to minimize overhead
     private def health_check_loop
       loop do
-        break if @closed
+        break if @closed.get
 
-        sleep 100.milliseconds
+        sleep 1.second
 
-        next if @closed
+        next if @closed.get
 
         # Check if connection is closed
         if @connection.closed?

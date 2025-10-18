@@ -11,9 +11,9 @@ module Lavinmq
     @buffer : MessageBuffer
     @client : Client
     @queue_name : String
-    @channel : AMQP::Client::Channel?
-    @closed : Bool = false
-    @mutex : Mutex
+    @channel : Atomic(AMQP::Client::Channel?)
+    @closed : Atomic(Bool)
+    @mutex : Mutex # Only for channel creation and flush
     @flush_fiber : Fiber?
     @retry_counts : Hash(String, Int32) = Hash(String, Int32).new
 
@@ -32,29 +32,33 @@ module Lavinmq
     )
       @buffer = MessageBuffer.new(buffer_size)
       @mutex = Mutex.new
-      @channel = nil
+      @channel = Atomic(AMQP::Client::Channel?).new(nil)
+      @closed = Atomic(Bool).new(false)
 
       # Start flush fiber to send buffered messages
       @flush_fiber = spawn { flush_loop }
     end
 
     # Publish a message (non-blocking, zero latency)
+    # Uses lock-free atomic operations for maximum concurrency
     def publish(message : String) : Nil
-      return if @closed
+      return if @closed.get
 
-      # Try fast path with cached channel
-      @mutex.synchronize do
-        if ch = @channel
-          unless ch.closed?
-            begin
-              send_message_fast(ch, message)
-              return
-            rescue ex
-              Log.debug(exception: ex) { "Fast path failed, queuing message" }
-              @channel = nil
-            end
-          else
-            @channel = nil
+      # Optimistic fast path: try cached channel if available (lock-free atomic load)
+      if ch = @channel.get
+        if ch.closed?
+          # Channel is closed, atomically clear it
+          @channel.compare_and_set(ch, nil)
+        else
+          begin
+            # Fast path: use cached channel without mutex or connection retrieval
+            send_message_fast(ch, message)
+            return
+          rescue ex
+            # Channel failed, atomically clear cache and fall through to queue
+            Log.debug(exception: ex) { "Fast path failed, queuing message" }
+            # Use compare_and_set to only clear if it's still the same channel
+            @channel.compare_and_set(ch, nil)
           end
         end
       end
@@ -65,18 +69,15 @@ module Lavinmq
 
     # Close producer
     def close : Nil
-      @mutex.synchronize do
-        return if @closed
-        @closed = true
-      end
+      # Atomically set closed flag - prevents TOCTOU bug
+      return unless @closed.compare_and_set(false, true)
 
       # Flush remaining messages
       flush_buffered_messages
 
-      # Close channel
-      @mutex.synchronize do
-        @channel.try &.close rescue nil
-        @channel = nil
+      # Atomically clear and close channel
+      if ch = @channel.swap(nil)
+        ch.close rescue nil
       end
 
       Log.info { "Producer closed for queue: #{@queue_name}" }
@@ -173,59 +174,42 @@ module Lavinmq
     end
 
     private def get_or_create_channel : AMQP::Client::Channel
-      # Try with retry to handle reconnection under high load
-      retries = 0
-      max_retries = 3
-
-      loop do
-        @mutex.synchronize do
-          # Check if we have a cached channel
-          if ch = @channel
-            unless ch.closed?
-              return ch
-            end
-            Log.debug { "Cached channel is closed, creating new channel" }
-            @channel = nil
-          end
+      # Check if we have a cached channel and if it's still open (atomic load)
+      if ch = @channel.get
+        unless ch.closed?
+          return ch
         end
+        # Channel is closed, atomically clear cache
+        Log.debug { "Cached channel is closed, creating new channel" }
+        @channel.compare_and_set(ch, nil)
+      end
 
-        begin
-          # Create new channel from client connection (outside mutex to reduce contention)
-          conn = @client.connection
-          new_channel = conn.channel
+      # Create new channel from client connection
+      # Note: Multiple fibers may create channels concurrently here,
+      # but CAS below ensures only one gets cached
+      conn = @client.connection
+      new_channel = conn.channel
+      Log.debug { "Created new channel for queue: #{@queue_name}" }
 
-          @mutex.synchronize do
-            # Double-check no one else created a channel while we were waiting
-            if existing = @channel
-              unless existing.closed?
-                new_channel.close rescue nil
-                return existing
-              end
-            end
-
-            @channel = new_channel
-            Log.debug { "Created new channel for queue: #{@queue_name}" }
-            return new_channel
-          end
-        rescue ex
-          retries += 1
-
-          if retries >= max_retries
-            # Out of retries - let caller handle (will buffer message)
-            Log.debug(exception: ex) { "Failed to create channel after #{retries} retries" }
-            raise ex
-          end
-
-          # Connection might be reconnecting - wait briefly and retry
-          Log.debug { "Retry #{retries}/#{max_retries} creating channel (connection may be reconnecting)" }
-          sleep 5.milliseconds
+      # Atomically set the new channel only if it's still nil
+      # This prevents multiple fibers from creating duplicate channels
+      if @channel.compare_and_set(nil, new_channel)
+        return new_channel
+      else
+        # Another fiber already created a channel, close ours and use theirs
+        new_channel.close rescue nil
+        # Get the channel that was set by another fiber
+        if existing = @channel.get
+          return existing
         end
+        # Rare case: channel was cleared between CAS and get, retry
+        return get_or_create_channel
       end
     end
 
     private def flush_loop : Nil
       loop do
-        break if @closed
+        break if @closed.get
         sleep 100.milliseconds # Fast flush for low latency
         flush_buffered_messages if has_connection?
       end
@@ -258,9 +242,8 @@ module Lavinmq
           end
 
           # Clear and close the cached channel to force recreation on next attempt
-          @mutex.synchronize do
-            @channel.try &.close rescue nil
-            @channel = nil
+          if ch = @channel.swap(nil)
+            ch.close rescue nil
           end
         end
       end
