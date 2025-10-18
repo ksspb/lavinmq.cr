@@ -9,11 +9,11 @@ module Lavinmq
     @mode : Config::PublishMode
     @buffer_policy : Config::BufferPolicy
     @buffer : MessageBuffer
-    @connection_manager : ConnectionManager
+    @client : Client
     @queue_name : String
-    @channel : Atomic(AMQP::Client::Channel?)
-    @closed : Atomic(Bool)
-    @mutex : Mutex # Still needed for flush_buffered_messages
+    @channel : AMQP::Client::Channel?
+    @closed : Bool = false
+    @mutex : Mutex
     @flush_fiber : Fiber?
     @retry_counts : Hash(String, Int32) = Hash(String, Int32).new
 
@@ -24,7 +24,7 @@ module Lavinmq
     @on_error : Proc(String, String, Exception, Nil)?
 
     def initialize(
-      @connection_manager : ConnectionManager,
+      @client : Client,
       @queue_name : String,
       @mode : Config::PublishMode = Config::PublishMode::Confirm,
       @buffer_policy : Config::BufferPolicy = Config::BufferPolicy::Block,
@@ -32,37 +32,29 @@ module Lavinmq
     )
       @buffer = MessageBuffer.new(buffer_size)
       @mutex = Mutex.new
-      @channel = Atomic(AMQP::Client::Channel?).new(nil)
-      @closed = Atomic(Bool).new(false)
+      @channel = nil
 
       # Start flush fiber to send buffered messages
       @flush_fiber = spawn { flush_loop }
-
-      # Listen for reconnections to flush buffer
-      @connection_manager.on_connect do
-        spawn { flush_buffered_messages }
-      end
     end
 
     # Publish a message (non-blocking, zero latency)
     def publish(message : String) : Nil
-      return if @closed.get
+      return if @closed
 
-      # Optimistic fast path: try cached channel if available (lock-free atomic load)
-      if ch = @channel.get
-        if ch.closed?
-          # Channel is closed, atomically clear it
-          @channel.compare_and_set(ch, nil)
-        else
-          begin
-            # Fast path: use cached channel without connection retrieval
-            send_message_fast(ch, message)
-            return
-          rescue ex
-            # Channel failed, atomically clear cache and fall through to queue
-            Log.debug(exception: ex) { "Fast path failed, queuing message" }
-            # Use compare_and_set to only clear if it's still the same channel
-            @channel.compare_and_set(ch, nil)
+      # Try fast path with cached channel
+      @mutex.synchronize do
+        if ch = @channel
+          unless ch.closed?
+            begin
+              send_message_fast(ch, message)
+              return
+            rescue ex
+              Log.debug(exception: ex) { "Fast path failed, queuing message" }
+              @channel = nil
+            end
+          else
+            @channel = nil
           end
         end
       end
@@ -73,15 +65,18 @@ module Lavinmq
 
     # Close producer
     def close : Nil
-      # Atomically set closed flag - prevents TOCTOU bug
-      return unless @closed.compare_and_set(false, true)
+      @mutex.synchronize do
+        return if @closed
+        @closed = true
+      end
 
       # Flush remaining messages
       flush_buffered_messages
 
-      # Atomically clear and close channel
-      if ch = @channel.swap(nil)
-        ch.close rescue nil
+      # Close channel
+      @mutex.synchronize do
+        @channel.try &.close rescue nil
+        @channel = nil
       end
 
       Log.info { "Producer closed for queue: #{@queue_name}" }
@@ -118,7 +113,7 @@ module Lavinmq
     end
 
     private def has_connection? : Bool
-      @connection_manager.state == Config::ConnectionState::Connected
+      @client.connected?
     end
 
     private def handle_buffering(message : String) : Nil
@@ -178,61 +173,28 @@ module Lavinmq
     end
 
     private def get_or_create_channel : AMQP::Client::Channel
-      # Check if we have a cached channel and if it's still open (atomic load)
-      if ch = @channel.get
-        unless ch.closed?
-          return ch
-        end
-        # Channel is closed, atomically clear cache
-        Log.debug { "Cached channel is closed, creating new channel" }
-        @channel.compare_and_set(ch, nil)
-      end
-
-      # Try non-blocking connection first
-      if conn = @connection_manager.connection?
-        new_channel = conn.channel
-        Log.debug { "Created new channel for queue: #{@queue_name}" }
-
-        # Atomically set the new channel only if it's still nil
-        # This prevents multiple fibers from creating duplicate channels
-        if @channel.compare_and_set(nil, new_channel)
-          return new_channel
-        else
-          # Another fiber already created a channel, close ours and use theirs
-          new_channel.close rescue nil
-          # Get the channel that was set by another fiber
-          if existing = @channel.get
-            return existing
+      @mutex.synchronize do
+        # Check if we have a cached channel
+        if ch = @channel
+          unless ch.closed?
+            return ch
           end
-          # Rare case: channel was cleared between CAS and get, retry
-          return get_or_create_channel
+          Log.debug { "Cached channel is closed, creating new channel" }
+          @channel = nil
         end
-      end
 
-      # Fallback to blocking connection (only used by background flush)
-      conn = @connection_manager.connection
-      new_channel = conn.channel
-      Log.debug { "Created new channel for queue: #{@queue_name}" }
-
-      # Same atomic set logic for blocking path
-      if @channel.compare_and_set(nil, new_channel)
+        # Create new channel from client connection
+        conn = @client.connection
+        new_channel = conn.channel
+        @channel = new_channel
+        Log.debug { "Created new channel for queue: #{@queue_name}" }
         new_channel
-      else
-        # Another fiber already created a channel
-        new_channel.close rescue nil
-        # Get the channel that was set by another fiber
-        if existing = @channel.get
-          existing
-        else
-          # Rare case: channel was cleared, return our new channel
-          new_channel
-        end
       end
     end
 
     private def flush_loop : Nil
       loop do
-        break if @closed.get
+        break if @closed
         sleep 100.milliseconds # Fast flush for low latency
         flush_buffered_messages if has_connection?
       end
@@ -241,33 +203,32 @@ module Lavinmq
     private def flush_buffered_messages : Nil
       return if @buffer.empty?
 
-      @mutex.synchronize do
-        messages = @buffer.drain
-        messages.each do |msg|
-          begin
-            send_message(msg)
-            # Success - clear retry count for this message
+      messages = @buffer.drain
+      messages.each do |msg|
+        begin
+          send_message(msg)
+          # Success - clear retry count for this message
+          @retry_counts.delete(msg)
+        rescue ex
+          # Increment retry count for this message
+          retry_count = @retry_counts.fetch(msg, 0) + 1
+          @retry_counts[msg] = retry_count
+
+          if retry_count >= MAX_FLUSH_RETRIES
+            # Exceeded max retries - drop the message
+            Log.error(exception: ex) { "Message failed after #{retry_count} flush attempts, dropping" }
             @retry_counts.delete(msg)
-          rescue ex
-            # Increment retry count for this message
-            retry_count = @retry_counts.fetch(msg, 0) + 1
-            @retry_counts[msg] = retry_count
+            @on_drop.try &.call(msg, @queue_name, Config::DropReason::FlushRetryExceeded)
+          else
+            # Re-buffer for another attempt
+            Log.warn(exception: ex) { "Failed to flush message (attempt #{retry_count}/#{MAX_FLUSH_RETRIES}), re-buffering" }
+            @buffer.enqueue(msg)
+          end
 
-            if retry_count >= MAX_FLUSH_RETRIES
-              # Exceeded max retries - drop the message
-              Log.error(exception: ex) { "Message failed after #{retry_count} flush attempts, dropping" }
-              @retry_counts.delete(msg)
-              @on_drop.try &.call(msg, @queue_name, Config::DropReason::FlushRetryExceeded)
-            else
-              # Re-buffer for another attempt
-              Log.warn(exception: ex) { "Failed to flush message (attempt #{retry_count}/#{MAX_FLUSH_RETRIES}), re-buffering" }
-              @buffer.enqueue(msg)
-            end
-
-            # Atomically clear and close the cached channel to force recreation on next attempt
-            if old_ch = @channel.swap(nil)
-              old_ch.close rescue nil
-            end
+          # Clear and close the cached channel to force recreation on next attempt
+          @mutex.synchronize do
+            @channel.try &.close rescue nil
+            @channel = nil
           end
         end
       end

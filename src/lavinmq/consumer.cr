@@ -4,7 +4,7 @@ module Lavinmq
   class Consumer
     Log = ::Log.for(self)
 
-    @connection_manager : ConnectionManager
+    @client : Client
     @queue_name : String
     @channel : AMQP::Client::Channel?
     @ack_tracker : AckTracker
@@ -16,17 +16,12 @@ module Lavinmq
     @mutex : Mutex
 
     def initialize(
-      @connection_manager : ConnectionManager,
+      @client : Client,
       @queue_name : String,
       @prefetch : Int32 = 100,
     )
       @ack_tracker = AckTracker.new
       @mutex = Mutex.new
-
-      # Listen for reconnections to resubscribe
-      @connection_manager.on_connect do
-        spawn { resubscribe }
-      end
     end
 
     # Subscribe to queue and process messages
@@ -70,11 +65,17 @@ module Lavinmq
       end
     end
 
+    # Check if consumer is subscribed
+    def subscribed? : Bool
+      @mutex.synchronize do
+        !@channel.nil? && !@consumer_tag.nil?
+      end
+    end
+
     # Close consumer
     def close : Nil
-      return if @closed
-
       @mutex.synchronize do
+        return if @closed
         @closed = true
       end
 
@@ -105,7 +106,7 @@ module Lavinmq
 
       begin
         # Get dedicated channel for this consumer
-        conn = @connection_manager.connection
+        conn = @client.connection
         ch = conn.channel
         @channel = ch
 
@@ -138,7 +139,8 @@ module Lavinmq
       end
     end
 
-    private def resubscribe : Nil
+    # Called by Client when connection is restored
+    protected def resubscribe : Nil
       return if @closed
       return unless @message_handler
 

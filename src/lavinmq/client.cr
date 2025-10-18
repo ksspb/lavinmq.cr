@@ -1,5 +1,5 @@
 module Lavinmq
-  # Main client API for LavinMQ
+  # Main client API for LavinMQ - Simplified event-driven architecture
   #
   # ## Example
   # ```
@@ -19,86 +19,81 @@ module Lavinmq
   class Client
     Log = ::Log.for(self)
 
-    getter connection_pool : ConnectionPool
+    getter connection : AMQP::Client::Connection
+    @amqp_url : String
     @config : Config
     @producers : Array(Producer)
     @consumers : Array(Consumer)
-    @closed : Atomic(Bool)
-    @pool_size : Int32
-    @next_pool_index : Atomic(Int32)
+    @closed : Bool = false
+    @reconnecting : Bool = false
+    @mutex : Mutex
 
-    # Initialize client with connection pool for high throughput and resilience
+    # Initialize client with event-driven auto-reconnection
     # @param amqp_url AMQP connection URL
     # @param config Configuration options
-    # @param pool_size Number of connections in pool (default: 5, recommended: 5-10)
-    def initialize(amqp_url : String, config : Config = Config.new, @pool_size : Int32 = 5)
-      @connection_pool = ConnectionPool.new(amqp_url, @pool_size, config)
-      @config = config
+    def initialize(@amqp_url : String, @config : Config = Config.new)
       @producers = [] of Producer
       @consumers = [] of Consumer
-      @closed = Atomic(Bool).new(false)
-      @next_pool_index = Atomic(Int32).new(0)
-      @connection_pool.connect
+      @mutex = Mutex.new
+      @connection = uninitialized AMQP::Client::Connection
 
-      Log.info { "Client initialized with connection pool (size: #{@pool_size})" }
+      connect
+
+      Log.info { "Client initialized with event-driven reconnection" }
     end
 
     # Create a producer for a queue
-    # Automatically distributes producers across pool connections for optimal performance
     def producer(
       queue_name : String,
       mode : Config::PublishMode = Config::PublishMode::Confirm,
       buffer_policy : Config::BufferPolicy = Config::BufferPolicy::Block,
       buffer_size : Int32 = @config.buffer_size,
     ) : Producer
-      raise ClosedError.new("Client is closed") if @closed.get
+      @mutex.synchronize do
+        raise ClosedError.new("Client is closed") if @closed
 
-      # Get connection manager from pool using round-robin
-      pool_index = @next_pool_index.add(1) % @pool_size
-      conn_mgr = @connection_pool.connection_manager(pool_index)
+        prod = Producer.new(
+          self,
+          queue_name,
+          mode: mode,
+          buffer_policy: buffer_policy,
+          buffer_size: buffer_size
+        )
 
-      prod = Producer.new(
-        conn_mgr,
-        queue_name,
-        mode: mode,
-        buffer_policy: buffer_policy,
-        buffer_size: buffer_size
-      )
+        @producers << prod
 
-      @producers << prod
-
-      Log.info { "Created producer for queue: #{queue_name} (pool index: #{pool_index})" }
-      prod
+        Log.info { "Created producer for queue: #{queue_name}" }
+        prod
+      end
     end
 
     # Create a consumer for a queue
-    # Each consumer gets its own dedicated channel
-    # Automatically distributes consumers across pool connections
     def consumer(
       queue_name : String,
       prefetch : Int32 = 100,
     ) : Consumer
-      raise ClosedError.new("Client is closed") if @closed.get
+      @mutex.synchronize do
+        raise ClosedError.new("Client is closed") if @closed
 
-      # Get connection manager from pool using round-robin
-      pool_index = @next_pool_index.add(1) % @pool_size
-      conn_mgr = @connection_pool.connection_manager(pool_index)
+        cons = Consumer.new(
+          self,
+          queue_name,
+          prefetch: prefetch
+        )
 
-      cons = Consumer.new(
-        conn_mgr,
-        queue_name,
-        prefetch: prefetch
-      )
+        @consumers << cons
 
-      @consumers << cons
-
-      Log.info { "Created consumer for queue: #{queue_name} (pool index: #{pool_index})" }
-      cons
+        Log.info { "Created consumer for queue: #{queue_name}" }
+        cons
+      end
     end
 
     # Close client and all producers/consumers
     def close : Nil
-      return unless @closed.compare_and_set(false, true)
+      @mutex.synchronize do
+        return if @closed
+        @closed = true
+      end
 
       Log.info { "Closing client..." }
 
@@ -120,8 +115,12 @@ module Lavinmq
         end
       end
 
-      # Close connection pool
-      @connection_pool.close
+      # Close connection
+      begin
+        @connection.close
+      rescue ex
+        Log.error(exception: ex) { "Error closing connection" }
+      end
 
       @producers.clear
       @consumers.clear
@@ -129,20 +128,71 @@ module Lavinmq
       Log.info { "Client closed" }
     end
 
-    # Get connection pool health status
-    # Returns true if at least half of connections are healthy
-    def healthy? : Bool
-      @connection_pool.healthy?
+    # Check if connected
+    def connected? : Bool
+      !@connection.closed?
     end
 
-    # Get number of healthy connections in pool
-    def healthy_connections : Int32
-      @connection_pool.healthy_count
+    # Internal: resubscribe all consumers (called after reconnection)
+    protected def resubscribe_all
+      @consumers.each do |cons|
+        spawn { cons.resubscribe }
+      end
     end
 
-    # Get total pool size
-    def pool_size : Int32
-      @pool_size
+    # Connect to AMQP server with event-driven reconnection
+    private def connect
+      Log.info { "Connecting to #{@amqp_url}..." }
+
+      client = AMQP::Client.new(@amqp_url)
+      @connection = client.connect
+
+      # Event-driven reconnection using on_close callback
+      # This fires INSTANTLY when connection closes (not polling-based)
+      @connection.on_close do |code, message|
+        Log.warn { "Connection closed: #{code} - #{message}" }
+
+        # Trigger reconnection unless intentionally closed
+        @mutex.synchronize do
+          reconnect unless @closed
+        end
+      end
+
+      Log.info { "Connected successfully" }
+
+      # Resubscribe all consumers if this is a reconnection
+      resubscribe_all
+    end
+
+    # Reconnect with exponential backoff
+    private def reconnect
+      return if @reconnecting || @closed
+      @reconnecting = true
+
+      spawn do
+        delay = @config.reconnect_initial_delay
+        attempt = 0
+
+        loop do
+          break if @closed
+
+          attempt += 1
+          Log.info { "Reconnecting in #{delay}s... (attempt #{attempt})" }
+          sleep delay.seconds
+
+          begin
+            connect
+            @reconnecting = false
+            Log.info { "Reconnected successfully" }
+            break
+          rescue ex
+            Log.error(exception: ex) { "Reconnect failed: #{ex.message}" }
+
+            # Exponential backoff
+            delay = [delay * @config.reconnect_multiplier, @config.reconnect_max_delay].min
+          end
+        end
+      end
     end
   end
 end
