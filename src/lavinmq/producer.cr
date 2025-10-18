@@ -173,22 +173,53 @@ module Lavinmq
     end
 
     private def get_or_create_channel : AMQP::Client::Channel
-      @mutex.synchronize do
-        # Check if we have a cached channel
-        if ch = @channel
-          unless ch.closed?
-            return ch
+      # Try with retry to handle reconnection under high load
+      retries = 0
+      max_retries = 3
+
+      loop do
+        @mutex.synchronize do
+          # Check if we have a cached channel
+          if ch = @channel
+            unless ch.closed?
+              return ch
+            end
+            Log.debug { "Cached channel is closed, creating new channel" }
+            @channel = nil
           end
-          Log.debug { "Cached channel is closed, creating new channel" }
-          @channel = nil
         end
 
-        # Create new channel from client connection
-        conn = @client.connection
-        new_channel = conn.channel
-        @channel = new_channel
-        Log.debug { "Created new channel for queue: #{@queue_name}" }
-        new_channel
+        begin
+          # Create new channel from client connection (outside mutex to reduce contention)
+          conn = @client.connection
+          new_channel = conn.channel
+
+          @mutex.synchronize do
+            # Double-check no one else created a channel while we were waiting
+            if existing = @channel
+              unless existing.closed?
+                new_channel.close rescue nil
+                return existing
+              end
+            end
+
+            @channel = new_channel
+            Log.debug { "Created new channel for queue: #{@queue_name}" }
+            return new_channel
+          end
+        rescue ex
+          retries += 1
+
+          if retries >= max_retries
+            # Out of retries - let caller handle (will buffer message)
+            Log.debug(exception: ex) { "Failed to create channel after #{retries} retries" }
+            raise ex
+          end
+
+          # Connection might be reconnecting - wait briefly and retry
+          Log.debug { "Retry #{retries}/#{max_retries} creating channel (connection may be reconnecting)" }
+          sleep 50.milliseconds
+        end
       end
     end
 
@@ -204,11 +235,22 @@ module Lavinmq
       return if @buffer.empty?
 
       messages = @buffer.drain
-      messages.each do |msg|
+
+      # Rate-limit flush to prevent overwhelming recovering connection
+      # Send in batches with small delays
+      batch_size = 100
+      batch_delay = 10.milliseconds
+
+      messages.each_with_index do |msg, idx|
         begin
           send_message(msg)
           # Success - clear retry count for this message
           @retry_counts.delete(msg)
+
+          # Add small delay between batches to prevent overwhelming connection
+          if (idx + 1) % batch_size == 0 && idx + 1 < messages.size
+            sleep batch_delay
+          end
         rescue ex
           # Increment retry count for this message
           retry_count = @retry_counts.fetch(msg, 0) + 1

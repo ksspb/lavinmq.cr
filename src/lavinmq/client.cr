@@ -27,8 +27,9 @@ module Lavinmq
     @closed : Bool = false
     @reconnecting : Bool = false
     @mutex : Mutex
+    @health_check_fiber : Fiber?
 
-    # Initialize client with event-driven auto-reconnection
+    # Initialize client with hybrid event-driven + polling reconnection
     # @param amqp_url AMQP connection URL
     # @param config Configuration options
     def initialize(@amqp_url : String, @config : Config = Config.new)
@@ -39,7 +40,10 @@ module Lavinmq
 
       connect
 
-      Log.info { "Client initialized with event-driven reconnection" }
+      # Start health check polling as fallback for on_close
+      @health_check_fiber = spawn { health_check_loop }
+
+      Log.info { "Client initialized with hybrid event-driven + polling reconnection" }
     end
 
     # Create a producer for a queue
@@ -140,59 +144,121 @@ module Lavinmq
       end
     end
 
-    # Connect to AMQP server with event-driven reconnection
+    # Connect to AMQP server with event-driven reconnection + timeout
     private def connect
       Log.info { "Connecting to #{@amqp_url}..." }
 
-      client = AMQP::Client.new(@amqp_url)
-      @connection = client.connect
+      # Add timeout to prevent hanging
+      timeout_channel = Channel(Bool).new
+      spawn do
+        begin
+          client = AMQP::Client.new(@amqp_url)
+          @connection = client.connect
 
-      # Event-driven reconnection using on_close callback
-      # This fires INSTANTLY when connection closes (not polling-based)
-      @connection.on_close do |code, message|
-        Log.warn { "Connection closed: #{code} - #{message}" }
+          # Event-driven reconnection using on_close callback
+          # This fires INSTANTLY when connection closes
+          # IMPORTANT: Don't block on mutex to avoid deadlock under high load
+          @connection.on_close do |code, message|
+            Log.warn { "Connection closed: #{code} - #{message}" }
 
-        # Trigger reconnection unless intentionally closed
-        @mutex.synchronize do
-          reconnect unless @closed
+            # Spawn immediately without grabbing mutex - prevents deadlock
+            spawn { trigger_reconnect }
+          end
+
+          timeout_channel.send(true)
+        rescue ex
+          Log.error(exception: ex) { "Connection failed: #{ex.message}" }
+          timeout_channel.send(false)
         end
       end
 
-      Log.info { "Connected successfully" }
-
-      # Resubscribe all consumers if this is a reconnection
-      resubscribe_all
+      # Wait for connection with timeout
+      select
+      when success = timeout_channel.receive
+        if success
+          Log.info { "Connected successfully" }
+          # Resubscribe all consumers if this is a reconnection
+          resubscribe_all
+        else
+          raise ConnectionError.new("Connection failed")
+        end
+      when timeout(10.seconds)
+        raise ConnectionError.new("Connection timeout after 10 seconds")
+      end
     end
 
-    # Reconnect with exponential backoff
-    private def reconnect
-      return if @reconnecting || @closed
-      @reconnecting = true
+    # Trigger reconnection (thread-safe)
+    private def trigger_reconnect
+      should_reconnect = false
+
+      @mutex.synchronize do
+        if !@reconnecting && !@closed
+          @reconnecting = true
+          should_reconnect = true
+        end
+      end
+
+      return unless should_reconnect
 
       spawn do
         delay = @config.reconnect_initial_delay
         attempt = 0
 
         loop do
+          # Check closed flag without mutex for fast exit
           break if @closed
 
           attempt += 1
           Log.info { "Reconnecting in #{delay}s... (attempt #{attempt})" }
           sleep delay.seconds
 
+          break if @closed
+
           begin
             connect
-            @reconnecting = false
-            Log.info { "Reconnected successfully" }
+
+            # Successfully reconnected - clear flag
+            @mutex.synchronize do
+              @reconnecting = false
+            end
+
+            Log.info { "Reconnected successfully after #{attempt} attempts" }
             break
           rescue ex
-            Log.error(exception: ex) { "Reconnect failed: #{ex.message}" }
+            Log.error(exception: ex) { "Reconnect failed (attempt #{attempt}): #{ex.message}" }
 
             # Exponential backoff
             delay = [delay * @config.reconnect_multiplier, @config.reconnect_max_delay].min
           end
         end
+
+        # If loop exits due to @closed, clear reconnecting flag
+        if @closed
+          @mutex.synchronize do
+            @reconnecting = false
+          end
+        end
       end
+    end
+
+    # Health check loop - polling fallback for when on_close doesn't fire
+    # Runs every 100ms to detect connection loss under high load
+    private def health_check_loop
+      loop do
+        break if @closed
+
+        sleep 100.milliseconds
+
+        next if @closed
+
+        # Check if connection is closed
+        if @connection.closed?
+          Log.debug { "Health check detected closed connection" }
+          trigger_reconnect
+        end
+      end
+    rescue ex
+      Log.error(exception: ex) { "Health check loop error: #{ex.message}" }
     end
   end
 end
