@@ -218,7 +218,7 @@ module Lavinmq
 
           # Connection might be reconnecting - wait briefly and retry
           Log.debug { "Retry #{retries}/#{max_retries} creating channel (connection may be reconnecting)" }
-          sleep 50.milliseconds
+          sleep 5.milliseconds
         end
       end
     end
@@ -236,21 +236,11 @@ module Lavinmq
 
       messages = @buffer.drain
 
-      # Rate-limit flush to prevent overwhelming recovering connection
-      # Send in batches with small delays
-      batch_size = 100
-      batch_delay = 10.milliseconds
-
-      messages.each_with_index do |msg, idx|
+      messages.each do |msg|
         begin
           send_message(msg)
           # Success - clear retry count for this message
           @retry_counts.delete(msg)
-
-          # Add small delay between batches to prevent overwhelming connection
-          if (idx + 1) % batch_size == 0 && idx + 1 < messages.size
-            sleep batch_delay
-          end
         rescue ex
           # Increment retry count for this message
           retry_count = @retry_counts.fetch(msg, 0) + 1
